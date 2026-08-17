@@ -99,6 +99,50 @@ imgmatch-bridge /path/to/thumbnails_set /path/to/originals_set \
 
 ---
 
+## Programming Usage
+
+### Includes
+```python
+from pathlib import Path
+from image_bridge_toolkit.cache_builder import ImageCacheBuilder
+from image_bridge_toolkit.matcher import run_match
+```
+
+### --- Tool A: build/refresh caches ---
+```python
+builder = ImageCacheBuilder("/data/deviantart", workers=8)
+stats = builder.run()          # returns dict: dirs, files_seen, files_updated, files_reused
+print(stats)
+
+builder = ImageCacheBuilder("/data/originals", workers=16)
+builder.run()
+```
+
+### --- Tool B: match ---
+```python
+run_match(
+    da_root="/data/deviantart",
+    orig_root="/data/originals",
+    output_path="bridge_map.jsonl",
+    max_hamming=16,
+    candidate_threshold=0.03,
+    do_direct_compare=True,
+    workers=8,
+    resume=True,
+)
+```
+
+### read results back in
+```python
+import json
+with open("bridge_map.jsonl") as f:
+    for line in f:
+        result = json.loads(line)
+        print(result["query_path"], "->", len(result["top_matches"]), "candidates")
+```
+
+---
+
 ## License & Copyright
 
 * **Source Code (`src/`)**: Licensed under the [MIT License](https://www.google.com/search?q=LICENSE).
