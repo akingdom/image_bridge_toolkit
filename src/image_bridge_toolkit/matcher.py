@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Set
 
 import numpy as np
 
+from . import __version__
 from .dataset_loader import Dataset, load_dataset
 from .logging_utils import get_logger
 from .similarity import direct_ssim, hamming_matrix, visual_sig_distance
@@ -66,6 +67,56 @@ def _already_done(output_path: Path) -> Set[str]:
                 continue
     return done
 
+def compute_similarity(
+    q_luma: int,
+    q_color: int,
+    q_wf: np.ndarray,
+    q_lab: np.ndarray,
+    q_sig: List[Dict[str, float]],
+    t_luma: int,
+    t_color: int,
+    t_wf: np.ndarray,
+    t_lab: np.ndarray,
+    t_sig: List[Dict[str, float]],
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Compute a composite similarity score and return detailed metrics.
+    Returns (confidence, metrics) where metrics contains raw distances.
+    """
+    # 1. Hamming
+    h_luma = bin(q_luma ^ t_luma).count('1')
+    h_color = bin(q_color ^ t_color).count('1')
+    h_combined = 0.7 * (h_luma / 64.0) + 0.3 * (h_color / 64.0)  # normalised 0-1
+
+    # 2. Waveform
+    wf_dist = float(np.linalg.norm(q_wf - t_wf))
+
+    # 3. LAB
+    lab_dist = float(np.linalg.norm(q_lab - t_lab) / 100.0)
+
+    # 4. Signature
+    sig_dist = visual_sig_distance(q_sig, t_sig) if q_sig and t_sig else 0.0
+
+    # 5. Similarity scores (clipped)
+    s_h = max(0.0, 1.0 - (h_combined * 20.0))   # h_combined in [0,1], scale to [0,20] bits
+    s_w = max(0.0, 1.0 - (wf_dist / 0.5))
+    s_l = max(0.0, 1.0 - lab_dist)
+    s_sig = max(0.0, 1.0 - sig_dist)
+
+    confidence = 0.35 * s_h + 0.35 * s_w + 0.15 * s_l + 0.15 * s_sig
+
+    metrics = {
+        "hamming_luma": h_luma,
+        "hamming_color": h_color,
+        "waveform_dist": wf_dist,
+        "lab_dist": lab_dist,
+        "sig_dist": sig_dist,
+        "s_h": s_h,
+        "s_w": s_w,
+        "s_l": s_l,
+        "s_sig": s_sig,
+    }
+    return confidence, metrics
 
 def match_one(
     q_idx: int,
@@ -94,29 +145,17 @@ def match_one(
 
     scores = []
     for pos, orig_idx in enumerate(cand_indices):
-        h_dist = hamming_combined[orig_idx]
-        w_dist = wf_dists[pos]
-        l_dist = lab_dists[pos]
-
-        s_h = max(0.0, 1.0 - (h_dist / 20.0))
-        s_w = max(0.0, 1.0 - (w_dist / 0.5))
-        s_l = max(0.0, 1.0 - l_dist)
-
-        sig_dist = visual_sig_distance(q_sig, orig.signatures[orig_idx])
-        s_sig = max(0.0, 1.0 - sig_dist)
-
-        composite = float(0.35 * s_h + 0.35 * s_w + 0.15 * s_l + 0.15 * s_sig)
+        confidence, metrics = compute_similarity(
+            q_luma, q_color, q_wf, q_lab, q_sig,
+            int(orig.phash_luma[orig_idx]), int(orig.phash_color[orig_idx]),
+            orig.waveform[orig_idx], orig.lab[orig_idx],
+            orig.signatures[orig_idx]
+        )
         scores.append({
             "orig_idx": int(orig_idx),
             "match_path": orig.paths[orig_idx],
-            "confidence": composite,
-            "metrics": {
-                "hamming_luma": int(dist_luma[orig_idx]),
-                "hamming_color": int(dist_color[orig_idx]),
-                "waveform_dist": round(float(w_dist), 6),
-                "lab_dist": round(float(l_dist), 6),
-                "sig_dist": round(float(sig_dist), 6),
-            },
+            "confidence": confidence,
+            "metrics": metrics,
         })
 
     scores.sort(key=lambda c: c["confidence"], reverse=True)
@@ -197,6 +236,47 @@ def run_match(
 
     log.info("Done in %.1fs -> %s", time.time() - t0, out_path)
 
+def compute_topological_similarity(q_sigs: List[Dict], i_sigs: List[Dict]) -> float:
+    """
+    Experimental: similarity using topology fields (curvature, elongation, gradient)
+    in addition to position and colour.
+
+    Greedy per‑node matching: each query node picks its best match among index nodes.
+    Returns 0.0–1.0, higher = more similar.
+    """
+    if not q_sigs or not i_sigs:
+        return 0.0
+
+    matched_scores = []
+    for q in q_sigs:
+        best_score = 0.0
+        q_pos = np.array([q["x"], q["y"]])
+        for idx_node in i_sigs:
+            i_pos = np.array([idx_node["x"], idx_node["y"]])
+            # spatial distance (normalised)
+            dist = np.linalg.norm(q_pos - i_pos) / 141.42  # ~ sqrt(2)*100
+            if dist > 0.20:
+                continue
+            spatial_sim = max(0.0, 1.0 - (dist / 0.20))
+
+            # curvature similarity (κ)
+            kappa_diff = abs(q.get("curvature", 0.0) - idx_node.get("curvature", 0.0))
+            kappa_sim = max(0.0, 1.0 - (kappa_diff / 2.5))
+
+            # elongation similarity
+            elong_diff = abs(q.get("elongation", 0.0) - idx_node.get("elongation", 0.0))
+            elong_sim = max(0.0, 1.0 - elong_diff)
+
+            # orientation similarity (axis_phi)
+            phi_diff = abs(q.get("axis_phi", 0.0) - idx_node.get("axis_phi", 0.0))
+            phi_sim = np.cos(phi_diff) ** 2
+
+            # Combine
+            node_score = (spatial_sim * 0.25) + (kappa_sim * 0.30) + (elong_sim * 0.25) + (phi_sim * 0.20)
+            best_score = max(best_score, node_score)
+        matched_scores.append(best_score)
+
+    return float(np.mean(matched_scores)) if matched_scores else 0.0
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="imgmatch-bridge", description="Build a confidence-scored bridge map between two cached image datasets.")
@@ -209,6 +289,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-w", "--workers", type=int, default=0, help="Process pool size for per-query matching (default: single process).")
     p.add_argument("--no-resume", action="store_true", help="Ignore/overwrite any existing output file instead of resuming.")
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--version", action="version", version=f"image-bridge-toolkit {__version__}")
     return p
 
 

@@ -12,6 +12,11 @@ from .logging_utils import get_logger
 
 log = get_logger(__name__)
 
+def detect_cache_format(cache_data):
+    version = cache_data.get("version", "1.0")
+    if version.startswith("2."):
+        return "extended"
+    return "standard"
 
 def load_cache(dir_path: Path) -> Dict[str, Any]:
     """Returns {} for a missing OR corrupt cache file. Corruption is logged,

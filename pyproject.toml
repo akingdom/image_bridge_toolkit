@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "image-bridge-toolkit"
-version = "0.1.2"
+dynamic = ["version"]  # defined elsewhere
 description = "Cache-backed perceptual image fingerprinting and cross-dataset bridge matching."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -50,6 +50,9 @@ all = ["opencv-python-headless>=4.6", "tqdm>=4.65"]
 [project.scripts]
 imgcache-build = "image_bridge_toolkit.cache_builder:main"
 imgmatch-bridge = "image_bridge_toolkit.matcher:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "image_bridge_toolkit.__version__"}  # attribute in __init__
 
 [tool.setuptools.packages.find]
 where = ["src"]

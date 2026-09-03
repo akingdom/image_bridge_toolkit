@@ -90,6 +90,76 @@ imgmatch-bridge /path/to/thumbnails_set /path/to/originals_set \
 
 ---
 
+## `visual_sig` Schema (v2.0+)
+
+Each `visual_sig` entry is an array of signature points. Starting with this release, each point contains:
+
+| Field | Type | Range | Description |
+|-------|------|-------|-------------|
+| `x`, `y` | float | 0–100 | Normalised position (percentage) |
+| `size` | float | 0–100 | Spatial weight (percentage) |
+| `hex` | str | `#rrggbb` | Dominant colour |
+| `lab` | [float, float, float] | L:0–100, a/b:‑128–127 | CIELAB colour |
+| `grad_theta` | float | 0–2π | Gradient direction (radians) |
+| `grad_mag` | float | ≥0 | Gradient magnitude |
+| `elongation` | float | 0–1 | 0=round, 1=line |
+| `axis_phi` | float | 0–π | Principal orientation (radians) |
+| `primitive` | int | 0 or 1 | 0=plane, 1=edge |
+| `density` | float | 0–1 | Local point concentration |
+| `curvature` | float | ≥0 | Isophote curvature (clamped) |
+
+All fields are computed from the image. Consumers that only read `x`, `y`, `hex`, `size` will continue to work unchanged; the extra fields are ignored.
+
+Example access:
+```python
+cache = json.load(open("image_cache.json"))
+points = cache["image.jpg"]["visual_sig"]
+for p in points:
+    print(f"{p['hex']} at ({p['x']:.1f}, {p['y']:.1f}) curvature={p['curvature']:.2f}")
+```
+
+### visual_sig — Neighbour‑Based Topology (v2.0+)
+
+Each `visual_sig` node now carries a flattened set of topology fields computed from the **spatial neighbourhood** of the point within a dense scaffold (16×16 grid). This enables categorical recognition of shapes (e.g., apple, person, car) and handles non‑rigid curves.
+
+| Field | Description |
+|-------|-------------|
+| `x`, `y` | Position (0‑100) |
+| `size` | Saliency (Voronoi assignment over scaffold) |
+| `hex`, `lab` | Dominant colour (hex + CIELAB) |
+| `grad_theta`, `grad_mag` | Gradient direction (radians) and magnitude |
+| `elongation`, `axis_phi` | Shape anisotropy (0=round, 1=line) and principal axis |
+| `primitive` | 0=plane, 1=edge (quadrant variance) |
+| `density` | Local point concentration (fraction of scaffold within radius) |
+| `curvature` | Local bend κ (clamped to 2.5) |
+
+**Selection algorithm:**
+- **Greedy phase:** picks colour‑diverse, spatially spread points.
+- **Structural phase:** scores remaining points by elongation, curvature, gradient; applies NMS for spacing.
+- **Budget:** dynamic between 10 and 20 points.
+
+**Experimental matcher:** `compute_topological_similarity` uses these fields for more discriminating matching.
+
+### How Topology Fields Are Computed
+
+For each `visual_sig` point, topology fields are sampled from the image at that location:
+
+1. **Gradient** (`grad_theta`, `grad_mag`): First derivatives `(Ix, Iy)` from the grayscale image.
+2. **Shape** (`elongation`, `axis_phi`): Hessian eigenvalues and eigenvectors `(Ixx, Iyy, Ixy)`.
+   - `elongation` = `1 - |λ_min / λ_max|` (0 = round, 1 = line)
+   - `axis_phi` = angle of the dominant eigenvector.
+3. **Primitive** (`primitive`): 1 if edge‑like (`elongation > 0.5` and `grad_mag > 5.0`), else 0.
+4. **Curvature** (`curvature`): Isophote curvature formula:
+   ```
+   κ = |Ixx·Iy² - 2·Ixy·Ix·Iy + Iyy·Ix²| / (Ix² + Iy²)^(3/2)
+   ```
+5. **Density** (`density`): Fraction of other points within 0.1 normalized distance.
+6. **Colour** (`lab`): Converted from `hex` using sRGB → XYZ → CIELAB.
+
+All derivatives are computed on a 64×64 resized grayscale image and sampled at each point's location.
+
+---
+
 ## Cache Integrity & Updating
 
 * **`mtime` Matching**: A cached entry is preserved as long as the file's modification time matches the record in `image_cache.json`.

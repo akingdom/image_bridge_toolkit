@@ -22,7 +22,7 @@ from typing import Any, Dict, FrozenSet, List, Tuple
 
 from PIL import Image
 
-from . import calculators
+from . import calculators, __version__
 from .cache_io import load_cache, write_cache_atomic
 from .constants import ALL_GROUPS
 from .logging_utils import get_logger
@@ -140,6 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-w", "--workers", type=int, default=0, help="Process pool size (default: CPU count).")
     p.add_argument("--force", action="store_true", help="Ignore existing caches and recompute everything.")
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--version", action="version", version=f"image-bridge-toolkit {__version__}")
     return p
 
 
