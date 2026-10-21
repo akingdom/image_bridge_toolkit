@@ -66,3 +66,17 @@ venv.bak/
 *.swo
 *~
 .DS_Store
+x.py
+/diag_v3
+/diag_after
+*.bak
+*.orig
+patch-IBT.py
+bundle_diagnostics.py
+.backup-ibt-20260927-020756/src_image_bridge_toolkit_constants.py
+.backup-ibt-20260927-020756/src_image_bridge_toolkit_calculators.py
+.backup-ibt-20260927-020756/src_image_bridge_toolkit_cache_io.py
+.backup-ibt-20260927-020756/src_image_bridge_toolkit_cache_builder.py
+.backup-ibt-20260927-020756/src_image_bridge_toolkit___init__.py
+.backup-ibt-20260927-020756/pyproject.toml
+diagnose_visual_sig.py

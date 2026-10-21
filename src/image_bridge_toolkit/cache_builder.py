@@ -22,9 +22,10 @@ from typing import Any, Dict, FrozenSet, List, Tuple
 
 from PIL import Image
 
-from . import calculators, __version__
+from . import calculators, legacy, __version__
+from .legacy import read_writer_version
 from .cache_io import load_cache, write_cache_atomic
-from .constants import ALL_GROUPS
+from .constants import ALL_GROUPS, VIDEO_EXTENSIONS
 from .logging_utils import get_logger
 from .planner import plan_entry
 from .scanner import scan_tree
@@ -36,26 +37,66 @@ _Job = Tuple[str, FrozenSet[str]]  # (image_path, groups_to_compute)
 
 
 def _compute_groups(image_path: str, groups: FrozenSet[str]) -> Dict[str, Any]:
-    """Runs in a worker process. Never raises -- an unreadable/corrupt image
-    yields an empty update rather than killing the whole batch."""
+    """Runs in a worker process. Never raises.
+
+    Dispatches on file extension so image-only calculators never touch a
+    video container, and file-level groups (exact hashes, EXIF) still run
+    even when the image decoder fails -- a file that cannot be decoded can
+    still have a valid hash, which is itself a useful fact to record.
+    """
     if not groups:
         return {}
-    try:
-        with Image.open(image_path) as img:
-            img.load()
-            out: Dict[str, Any] = {}
-            if "hash" in groups:
-                out.update(calculators.compute_hashes(img))
-            if "sig" in groups:
-                out.update(calculators.compute_visual_signature(img))
-            if "lab" in groups:
-                out.update(calculators.compute_lab_metrics(img))
-            if "waveform" in groups:
-                out.update(calculators.compute_hist_waveform(img))
-            return out
-    except Exception as exc:
-        log.error("Failed to process %s: %s", image_path, exc)
-        return {}
+
+    out: Dict[str, Any] = {}
+    suffix = os.path.splitext(image_path)[1].lower()
+    is_video = suffix in VIDEO_EXTENSIONS
+
+    # File-level groups -- no decoding required.
+    if "exact" in groups:
+        out.update(calculators.compute_exact_hashes(image_path))
+    if "exif" in groups:
+        out.update(calculators.compute_exif(image_path))
+
+    if is_video:
+        if "video" in groups:
+            out.update(calculators.compute_video_signature(image_path))
+        return out
+
+    # Image-based groups. A decoder failure here is logged but does not
+    # discard the exact hash / EXIF values already collected above.
+    if any(g in groups for g in ("hash", "sig", "lab", "waveform")):
+        try:
+            with Image.open(image_path) as img:
+                img.load()
+                if "hash" in groups:
+                    out.update(calculators.compute_hashes(img))
+                if "sig" in groups:
+                    out.update(calculators.compute_visual_signature(img))
+                if "lab" in groups:
+                    out.update(calculators.compute_lab_metrics(img))
+                if "waveform" in groups:
+                    out.update(calculators.compute_hist_waveform(img))
+        except Exception as exc:
+            log.error("Failed to process %s: %s", image_path, exc)
+    return out
+
+
+def _looks_like_modern_cache(cache: Dict[str, Any]) -> bool:
+    """True if the cache carries IBT post-0.3.0 fields but no version stamp.
+
+    Distinguishes "cache predates meta tracking" (safe to re-migrate fully)
+    from "foreign writer stripped meta.versions" (cache is almost certainly
+    0.3.x: recompute sig only, and skip the pre-0.2.7 coordinate reflection,
+    which would corrupt a modern cache on decode failure). Requires md5
+    *and* sha256 together, since a writer that strips one may strip both,
+    and a 0.2.x cache has neither.
+    """
+    for key, entry in cache.items():
+        if key == legacy.META_KEY or not isinstance(entry, dict):
+            continue
+        if "md5" in entry and "sha256" in entry:
+            return True
+    return False
 
 
 def _worker(job: _Job) -> Tuple[str, Dict[str, Any]]:
@@ -76,6 +117,35 @@ class ImageCacheBuilder:
         for dir_path, images in scan_tree(self.root_dir):
             stats["dirs"] += 1
             cache = {} if self.force else load_cache(dir_path)
+
+            # Read the writer version BEFORE migrate() restamps it. This
+            # is what lets the planner distinguish a cache whose sig
+            # group was computed by an older algorithm from one whose
+            # sig group is current.
+            writer_version = read_writer_version(cache) if cache else None
+
+            # Migrate a cache written by an older version of this toolkit.
+            # `migrated` forces a write even if no images were recomputed.
+            # If the cache has IBT fields but no version stamp, a foreign
+            # writer is stripping meta.versions. Treat as 0.3.0: recompute
+            # sig only, skip the pre-0.2.7 reflection (which would corrupt
+            # a modern cache), skip exact/exif/hash/lab/waveform.
+            if cache and writer_version is None and _looks_like_modern_cache(cache):
+                log.warning(
+                    "%s: IBT fields present but meta.versions.ibt is missing; "
+                    "recomputing sig only (conservatively assuming 0.3.0). "
+                    "A foreign writer is stripping meta.versions - until "
+                    "that writer is fixed, this will recur on every run.",
+                    dir_path,
+                )
+                writer_version = "0.3.0"
+                cache, migrated = cache, False
+            else:
+                cache, migrated = legacy.migrate(cache)
+            if migrated:
+                log.info("%s: migrated cache from %s → %s", dir_path,
+                         writer_version or "unversioned", __version__)
+
             new_cache: Dict[str, Any] = {}
             jobs: List[_Job] = []
             job_meta: Dict[str, Dict[str, Any]] = {}
@@ -83,7 +153,11 @@ class ImageCacheBuilder:
             for img_path, mtime in images:
                 stats["files_seen"] += 1
                 fname = img_path.name
-                needed, base_entry = plan_entry(None if self.force else cache.get(fname), mtime)
+                suffix = img_path.suffix.lower()
+                needed, base_entry = plan_entry(
+                    None if self.force else cache.get(fname),
+                    mtime, suffix, writer_version,
+                )
                 if not needed:
                     new_cache[fname] = base_entry
                     stats["files_reused"] += 1
@@ -96,7 +170,14 @@ class ImageCacheBuilder:
                 stats["files_updated"] += len(jobs)
 
             # Only touch disk if something actually changed for this dir.
-            if jobs or len(new_cache) != len(cache) or self.force:
+            # The comparison ignores the top-level "meta" key (added by
+            # write_cache_atomic, not part of the image-entry set).
+            old_image_count = sum(1 for k in cache.keys() if k != legacy.META_KEY)
+            new_image_count = len(new_cache)
+            if (jobs
+                    or migrated
+                    or new_image_count != old_image_count
+                    or self.force):
                 write_cache_atomic(dir_path, new_cache)
 
             log.info("%s: %d image(s), %d updated", dir_path, len(images), len(jobs))

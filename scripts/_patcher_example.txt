@@ -1,0 +1,1032 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""patch_imgdesc.py — apply the imgdesc bugcheck fixes.
+
+The harness lives in scripts/_patcher.py. This file is the imgdesc-
+specific patch table plus a three-line tail.
+
+Run:
+
+    python patch_imgdesc.py --check       # verify anchors match
+    python patch_imgdesc.py --dry-run -v  # show the diff
+    python patch_imgdesc.py               # apply
+    python patch_imgdesc.py --restore     # undo
+"""
+from __future__ import annotations
+
+import sys
+from typing import List, Tuple
+
+from scripts._patcher import Patch, run
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Patch table — src/imgdesc/desc_builder.py
+# ══════════════════════════════════════════════════════════════════════
+
+def _p_desc_builder() -> List[Patch]:
+    return [
+        Patch(
+            "import random for backoff jitter",
+            old="""\
+import os
+import re
+import threading""",
+            new="""\
+import os
+import random
+import re
+import threading""",
+        ),
+        Patch(
+            "add _RETRYABLE_STATUS and DEPTH_NUM_CTX constants",
+            old="""\
+POSITIONING_MIN_DIM = 768
+
+JPEG_QUALITY = 92""",
+            new="""\
+POSITIONING_MIN_DIM = 768
+
+# HTTP statuses that warrant a retry with exponential backoff + jitter.
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+# Context window sent to Ollama, per depth. A 768px image through a
+# vision encoder produces roughly 2000-3500 tokens; Ollama's default
+# context (often 4096 or 2048) can be too small, the runner dies with
+# an assertion, and the HTTP layer reports a 500. These values give
+# headroom for the analysis prompt at each depth.
+DEPTH_NUM_CTX = {"brief": 8192, "standard": 12288, "deep": 16384}
+
+JPEG_QUALITY = 92""",
+        ),
+        Patch(
+            "insert capability + load-probe helpers before check_ollama",
+            old="""\
+def check_ollama() -> bool:
+    config = get_ollama_config()""",
+            new="""\
+# A 1x1 red PNG. The smallest image that still exercises the vision
+# projector end-to-end. Kept in source so there is no file dependency.
+_PROBE_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4"
+    "nGP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+
+
+def _has_vision_capability(url, model):
+    \"\"\"Ask Ollama whether this model advertises a vision capability.
+
+    Uses /api/show, which reports a `capabilities` list from Ollama
+    0.6.4 onward. Returns (True, None), (False, None), or (None, note)
+    when the capability list is unavailable so the caller can fall back
+    to a live probe.
+    \"\"\"
+    try:
+        r = requests.post(
+            f"{url}/api/show", json={"model": model}, timeout=10,
+        )
+    except requests.exceptions.RequestException as e:
+        return None, f"could not query /api/show: {e}"
+    if r.status_code >= 400:
+        return None, f"/api/show returned HTTP {r.status_code}"
+    try:
+        data = r.json()
+    except Exception:
+        return None, "/api/show returned non-JSON"
+    caps = data.get("capabilities")
+    if not isinstance(caps, list):
+        return None, ("this Ollama version does not report model "
+                      "capabilities (0.6.4+ reports them)")
+    lowered = [str(c).lower() for c in caps]
+    return ("vision" in lowered), None
+
+
+def _probe_vision_load(url, model, num_ctx=8192):
+    \"\"\"Send a 1x1 image and classify the outcome.
+
+    Returns (ok, kind, detail):
+
+        ok     True if the request succeeded.
+        kind   "ok" | "oom" | "unsupported" | "error"
+        detail Human-readable explanation; the Ollama body on failure.
+    \"\"\"
+    try:
+        r = requests.post(
+            f"{url}/api/generate",
+            json={
+                "model": model,
+                "prompt": ("What colour is the single pixel in this "
+                           "image? Answer with one colour word."),
+                "images": [_PROBE_PNG_B64],
+                "stream": False,
+                "options": {"num_predict": 6, "num_ctx": num_ctx},
+            },
+            timeout=120,
+        )
+    except requests.exceptions.Timeout:
+        return False, "error", "request timed out (120s)"
+    except requests.exceptions.RequestException as e:
+        return False, "error", f"request failed: {e}"
+
+    if r.status_code < 400:
+        try:
+            text = (r.json().get("response") or "").strip()
+        except Exception:
+            text = ""
+        return True, "ok", (f"answered {text[:60]!r}" if text
+                            else "accepted image request")
+
+    body = ""
+    try:
+        body = r.text[:500]
+    except Exception:
+        pass
+    low = body.lower()
+
+    if any(s in low for s in (
+        "does not support image",
+        "image input is not supported",
+        "does not support vision",
+        "unsupported content",
+        "images are not supported",
+    )):
+        return False, "unsupported", body
+
+    if any(s in low for s in (
+        "out-of-memory",
+        "out of memory",
+        "failed to allocate",
+        "projector cpu offload",
+        "startup failed",
+        "llama-server process has terminated",
+        "signal: killed",
+    )):
+        return False, "oom", body
+
+    return False, "error", body
+
+
+def check_ollama() -> bool:
+    config = get_ollama_config()""",
+        ),
+        Patch(
+            "check_ollama: capability check + classified probe",
+            old="""\
+        if model in available:
+            print(f"\u2705 Model '{model}' is available.")
+            return True
+        print(f"\u274c Model '{model}' not found in Ollama.")
+        print(f"   You can pull it with: ollama pull {model}")
+        return False
+    except requests.exceptions.RequestException as e:
+        print(f"\u274c Failed to check Ollama: {e}")
+        return False""",
+            new="""\
+        if model not in available:
+            print(f"\u274c Model '{model}' not found in Ollama.")
+            print(f"   You can pull it with: ollama pull {model}")
+            return False
+
+        # Capability check via /api/show. Definitive when Ollama is new
+        # enough to report it; falls back to a live probe otherwise.
+        has_vision, note = _has_vision_capability(url, model)
+        if has_vision is True:
+            print(f"\u2705 Model '{model}' declares vision capability.")
+        elif has_vision is False:
+            print(f"\u274c Model '{model}' does not declare a vision "
+                  f"capability.")
+            print("   Text-only models ignore the images field and answer "
+                  "without seeing the image.")
+            print("   Try a vision model: gemma3:4b, llama3.2-vision, "
+                  "moondream, or llava-phi3.")
+            return False
+        else:
+            print(f"\u26a0\ufe0f  Vision capability unknown ({note}).")
+
+        # Live probe. Loads the projector, so it also exercises the
+        # path that OOMs when the machine is memory-constrained. A
+        # failure here is a resource signal, not a statement about the
+        # model -- gemma3:4b, for instance, is a vision model that can
+        # still fail to load under memory pressure.
+        print(f"   Probing projector load with a 1x1 image\u2026")
+        ok, kind, detail = _probe_vision_load(url, model, num_ctx=8192)
+        if ok:
+            print(f"\u2705 Probe accepted an image request ({detail}).")
+            return True
+        if kind == "unsupported":
+            print("\u274c Model rejected an image request as unsupported:")
+            print(f"   {detail}")
+            return False
+        if kind == "oom":
+            print("\u26a0\ufe0f  Ollama could not load the vision "
+                  "projector (out-of-memory).")
+            print("   The model supports vision; the failure is a "
+                  "resource constraint right now.")
+            print("   Ollama said:")
+            for line in (detail or "").splitlines():
+                print(f"     {line}")
+            print("   Try, in order:")
+            print("     \u2022 ollama ps              see what is loaded")
+            print("     \u2022 ollama stop <model>    unload other models")
+            print("     \u2022 restart the Ollama server")
+            print("     \u2022 free memory: close other apps / VMs")
+            print("     \u2022 lower --num-ctx on the build command")
+            print("   Proceeding anyway. The first real image will tell "
+                  "us if the constraint has cleared; retries may handle "
+                  "a transient blip.")
+            return True
+        print("\u26a0\ufe0f  Vision probe failed with an unrecognised error:")
+        print(f"   {detail}")
+        print("   Proceeding anyway. If real images fail the same way, "
+              "the log will show the reason.")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"\u274c Failed to check Ollama: {e}")
+        return False""",
+        ),
+        Patch(
+            "_call_ollama signature: add num_ctx and image_name",
+            old="""\
+def _call_ollama(
+    *,
+    ollama_url: str,
+    model: str,
+    prompt: str,
+    b64: str,
+    timeout: int,
+    retries: int,
+    num_predict: int,
+    stage: str,
+    temperature: float = 0.0,
+    keep_alive: str = "30m",
+) -> Tuple[str, Dict[str, Any]]:""",
+            new="""\
+def _call_ollama(
+    *,
+    ollama_url: str,
+    model: str,
+    prompt: str,
+    b64: str,
+    timeout: int,
+    retries: int,
+    num_predict: int,
+    stage: str,
+    num_ctx: int = 8192,
+    image_name: str = "",
+    temperature: float = 0.0,
+    keep_alive: str = "30m",
+) -> Tuple[str, Dict[str, Any]]:""",
+        ),
+        Patch(
+            "send num_ctx in the Ollama payload",
+            old="""\
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "images": [b64],
+        "keep_alive": keep_alive,
+        "options": {"temperature": temperature, "num_predict": num_predict},
+    }""",
+            new="""\
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "images": [b64],
+        "keep_alive": keep_alive,
+        "options": {
+            "temperature": temperature,
+            "num_predict": num_predict,
+            "num_ctx": num_ctx,
+        },
+    }""",
+        ),
+        Patch(
+            "retry 4xx/5xx with backoff; capture the response body",
+            old="""\
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            r = requests.post(
+                f"{ollama_url}/api/generate", json=payload, timeout=timeout,
+            )
+            r.raise_for_status()
+            body = r.json()
+            stats = {
+                "stage": stage,
+                "eval_count": body.get("eval_count"),
+                "prompt_eval_count": body.get("prompt_eval_count"),
+                "eval_duration_ns": body.get("eval_duration"),
+                "total_duration_ns": body.get("total_duration"),
+                "done_reason": body.get("done_reason"),
+                "num_predict": num_predict,
+            }
+            return _clean_text(body.get("response", "")), stats
+        except requests.exceptions.Timeout as exc:
+            last_exc = exc
+            if attempt < retries:
+                wait = (attempt + 1) * 5
+                log.warning("Ollama timeout, retrying in %ds (attempt %d/%d)",
+                            wait, attempt + 1, retries)
+                time.sleep(wait)
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(f"Ollama request failed: {exc}") from exc
+    raise RuntimeError(f"Ollama timeout after {retries} retries") from last_exc""",
+            new="""\
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            r = requests.post(
+                f"{ollama_url}/api/generate", json=payload, timeout=timeout,
+            )
+            # Non-2xx handled explicitly so the Ollama body is captured
+            # (the runner dying, "exceeds context size", etc.) and the
+            # transient statuses are retried.
+            if r.status_code >= 400:
+                body_text = ""
+                try:
+                    body_text = r.text[:500]
+                except Exception:
+                    pass
+                if r.status_code in _RETRYABLE_STATUS and attempt < retries:
+                    wait = min(60.0, (2.0 ** attempt)
+                               + random.uniform(0.0, 2.0))
+                    log.warning(
+                        "Ollama HTTP %s stage=%s image=%s "
+                        "(attempt %d/%d), retrying in %.1fs: %s",
+                        r.status_code, stage, image_name or "?",
+                        attempt + 1, retries, wait, body_text,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise RuntimeError(
+                    f"Ollama HTTP {r.status_code} stage={stage} "
+                    f"image={image_name or '?'} num_ctx={num_ctx} "
+                    f"num_predict={num_predict}: "
+                    f"{body_text or r.reason}"
+                )
+            body = r.json()
+            stats = {
+                "stage": stage,
+                "eval_count": body.get("eval_count"),
+                "prompt_eval_count": body.get("prompt_eval_count"),
+                "eval_duration_ns": body.get("eval_duration"),
+                "total_duration_ns": body.get("total_duration"),
+                "done_reason": body.get("done_reason"),
+                "num_predict": num_predict,
+                "num_ctx": num_ctx,
+            }
+            return _clean_text(body.get("response", "")), stats
+        except requests.exceptions.Timeout as exc:
+            last_exc = exc
+            if attempt < retries:
+                wait = min(60.0, (2.0 ** attempt) + random.uniform(0.0, 2.0))
+                log.warning(
+                    "Ollama timeout stage=%s image=%s "
+                    "(attempt %d/%d), retrying in %.1fs",
+                    stage, image_name or "?", attempt + 1, retries, wait,
+                )
+                time.sleep(wait)
+                continue
+            raise RuntimeError(
+                f"Ollama timeout after {retries} retries stage={stage} "
+                f"image={image_name or '?'} num_ctx={num_ctx}"
+            ) from exc
+        except requests.exceptions.HTTPError as exc:
+            last_exc = exc
+            if attempt < retries:
+                wait = min(60.0, (2.0 ** attempt) + random.uniform(0.0, 2.0))
+                log.warning(
+                    "Ollama HTTPError stage=%s image=%s "
+                    "(attempt %d/%d), retrying in %.1fs: %s",
+                    stage, image_name or "?", attempt + 1, retries, wait, exc,
+                )
+                time.sleep(wait)
+                continue
+            raise RuntimeError(
+                f"Ollama request failed stage={stage} "
+                f"image={image_name or '?'}: {exc}"
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            if attempt < retries:
+                wait = min(60.0, (2.0 ** attempt) + random.uniform(0.0, 2.0))
+                log.warning(
+                    "Ollama connection error stage=%s image=%s "
+                    "(attempt %d/%d), retrying in %.1fs: %s",
+                    stage, image_name or "?", attempt + 1, retries, wait, exc,
+                )
+                time.sleep(wait)
+                continue
+            raise RuntimeError(
+                f"Ollama request failed stage={stage} "
+                f"image={image_name or '?'}: {exc}"
+            ) from exc
+    raise RuntimeError(
+        f"Ollama request gave up after {retries} retries stage={stage} "
+        f"image={image_name or '?'}"
+    ) from last_exc""",
+        ),
+        Patch(
+            "process_image: add num_ctx parameter",
+            old="""\
+def process_image(
+    image_path: Path,
+    ollama_url: str,
+    model: str,
+    timeout: int = 180,
+    retries: int = 2,
+    depth: str = "standard",
+    positioning: bool = True,
+    max_dim: Optional[int] = None,
+    visual_sig: Optional[List[Dict[str, Any]]] = None,
+    profile: Optional[str] = None,
+) -> Dict[str, Any]:""",
+            new="""\
+def process_image(
+    image_path: Path,
+    ollama_url: str,
+    model: str,
+    timeout: int = 180,
+    retries: int = 2,
+    depth: str = "standard",
+    positioning: bool = True,
+    max_dim: Optional[int] = None,
+    visual_sig: Optional[List[Dict[str, Any]]] = None,
+    profile: Optional[str] = None,
+    num_ctx: Optional[int] = None,
+) -> Dict[str, Any]:""",
+        ),
+        Patch(
+            "process_image: derive num_ctx from depth when omitted",
+            old="""\
+    if depth not in VALID_DEPTHS:
+        depth = "standard"
+    if max_dim is None:
+        max_dim = DEPTH_MAX_DIM[depth]
+    if positioning:
+        max_dim = max(max_dim, POSITIONING_MIN_DIM)""",
+            new="""\
+    if depth not in VALID_DEPTHS:
+        depth = "standard"
+    if max_dim is None:
+        max_dim = DEPTH_MAX_DIM[depth]
+    if positioning:
+        max_dim = max(max_dim, POSITIONING_MIN_DIM)
+    if num_ctx is None:
+        num_ctx = DEPTH_NUM_CTX[depth]""",
+        ),
+        Patch(
+            "classify call: thread num_ctx and image name",
+            old="""\
+        raw_cls, cls_stats = _call_ollama(
+            ollama_url=ollama_url, model=model,
+            prompt=_CLASSIFY_PROMPT, b64=classify_b64,
+            timeout=timeout, retries=retries, num_predict=8,
+            stage="classify",
+        )""",
+            new="""\
+        raw_cls, cls_stats = _call_ollama(
+            ollama_url=ollama_url, model=model,
+            prompt=_CLASSIFY_PROMPT, b64=classify_b64,
+            timeout=timeout, retries=retries, num_predict=8,
+            stage="classify",
+            num_ctx=num_ctx, image_name=image_path.name,
+        )""",
+        ),
+        Patch(
+            "aspects call: thread num_ctx and image name",
+            old="""\
+                raw_aspects, asp_stats = _call_ollama(
+                    ollama_url=ollama_url, model=model,
+                    prompt=profiles.ASPECT_PROMPT, b64=analysis_b64,
+                    timeout=timeout, retries=retries, num_predict=128,
+                    stage="aspects",
+                )""",
+            new="""\
+                raw_aspects, asp_stats = _call_ollama(
+                    ollama_url=ollama_url, model=model,
+                    prompt=profiles.ASPECT_PROMPT, b64=analysis_b64,
+                    timeout=timeout, retries=retries, num_predict=128,
+                    stage="aspects",
+                    num_ctx=num_ctx, image_name=image_path.name,
+                )""",
+        ),
+        Patch(
+            "analysis call: thread num_ctx and image name",
+            old="""\
+        raw, ana_stats = _call_ollama(
+            ollama_url=ollama_url, model=model,
+            prompt=analysis_prompt, b64=analysis_b64,
+            timeout=timeout, retries=retries,
+            num_predict={"brief": 640, "standard": 1100, "deep": 1580}[depth],
+            stage="analysis",
+        )""",
+            new="""\
+        raw, ana_stats = _call_ollama(
+            ollama_url=ollama_url, model=model,
+            prompt=analysis_prompt, b64=analysis_b64,
+            timeout=timeout, retries=retries,
+            num_predict={"brief": 640, "standard": 1100, "deep": 1580}[depth],
+            stage="analysis",
+            num_ctx=num_ctx, image_name=image_path.name,
+        )""",
+        ),
+        Patch(
+            "positioning call: thread num_ctx and image name",
+            old="""\
+            raw_pos, pos_stats = _call_ollama(
+                ollama_url=ollama_url, model=model,
+                prompt=_POSITIONING_PROMPT, b64=analysis_b64,
+                timeout=timeout, retries=retries, num_predict=256,
+                stage="positioning",
+            )""",
+            new="""\
+            raw_pos, pos_stats = _call_ollama(
+                ollama_url=ollama_url, model=model,
+                prompt=_POSITIONING_PROMPT, b64=analysis_b64,
+                timeout=timeout, retries=retries, num_predict=256,
+                stage="positioning",
+                num_ctx=num_ctx, image_name=image_path.name,
+            )""",
+        ),
+        Patch(
+            "process_worker: unpack num_ctx",
+            old="""\
+    (path, base, mtime, work,
+     url, model, timeout, retries,
+     depth, positioning, max_dim,
+     keep_raw) = args""",
+            new="""\
+    (path, base, mtime, work,
+     url, model, timeout, retries,
+     depth, positioning, max_dim,
+     keep_raw, num_ctx) = args""",
+        ),
+        Patch(
+            "process_worker: pass num_ctx to process_image",
+            old="""\
+            result = process_image(
+                path_obj, url, model, timeout, retries,
+                depth=depth, positioning=positioning, max_dim=max_dim,
+                visual_sig=vs_arg,
+            )""",
+            new="""\
+            result = process_image(
+                path_obj, url, model, timeout, retries,
+                depth=depth, positioning=positioning, max_dim=max_dim,
+                visual_sig=vs_arg, num_ctx=num_ctx,
+            )""",
+        ),
+        Patch(
+            "ImageDescBuilder.__init__: num_ctx; default workers to 1",
+            old="""\
+    def __init__(
+        self,
+        root_dir: str,
+        workers: int = 0,
+        force: bool = False,
+        dry_run: bool = False,
+        timeout: int = 180,
+        depth: str = "standard",
+        positioning: bool = True,
+        max_dim: Optional[int] = None,
+        keep_raw: bool = False,
+    ):
+        self.root_dir = Path(root_dir).resolve()
+        self.workers = workers or max(1, os.cpu_count() or 1)
+        self.force = force
+        self.dry_run = dry_run
+        self.timeout = timeout
+        self.depth = depth if depth in VALID_DEPTHS else "standard"
+        self.positioning = positioning
+        self.max_dim = max_dim
+        self.keep_raw = keep_raw
+        self.config = get_ollama_config()
+        self.ollama_url = self.config["url"]
+        self.ollama_model = self.config["model"]""",
+            new="""\
+    def __init__(
+        self,
+        root_dir: str,
+        workers: int = 1,
+        force: bool = False,
+        dry_run: bool = False,
+        timeout: int = 180,
+        depth: str = "standard",
+        positioning: bool = True,
+        max_dim: Optional[int] = None,
+        keep_raw: bool = False,
+        num_ctx: Optional[int] = None,
+    ):
+        self.root_dir = Path(root_dir).resolve()
+        # Default 1: Ollama is a single-instance server and concurrent
+        # vision requests cause HTTP 500 (the vision encoder cache is
+        # not shareable). The run loop additionally downgrades to serial
+        # whenever ai_desc work is queued.
+        self.workers = max(1, int(workers) if workers else 1)
+        self.force = force
+        self.dry_run = dry_run
+        self.timeout = timeout
+        self.depth = depth if depth in VALID_DEPTHS else "standard"
+        self.positioning = positioning
+        self.max_dim = max_dim
+        self.keep_raw = keep_raw
+        self.num_ctx = num_ctx
+        self.config = get_ollama_config()
+        self.ollama_url = self.config["url"]
+        self.ollama_model = self.config["model"]""",
+        ),
+        Patch(
+            "job tuple: carry num_ctx",
+            old="""\
+                    jobs.append((
+                        str(img_path), base, mtime, work,
+                        self.ollama_url, self.ollama_model,
+                        self.timeout, 2,
+                        self.depth, self.positioning, self.max_dim,
+                        self.keep_raw,
+                    ))""",
+            new="""\
+                    jobs.append((
+                        str(img_path), base, mtime, work,
+                        self.ollama_url, self.ollama_model,
+                        self.timeout, 2,
+                        self.depth, self.positioning, self.max_dim,
+                        self.keep_raw, self.num_ctx,
+                    ))""",
+        ),
+        Patch(
+            "run loop: serialise when ai_desc work is present",
+            old="""\
+                if jobs and not self.dry_run:
+                    if self.workers <= 1:
+                        for job in jobs:
+                            path, entry = process_worker(job)
+                            cache[job_meta[path]["fname"]] = entry
+                            stats["files_updated"] += 1
+                            # Snapshot after each image so a long directory is
+                            # observable within the flush interval, not just
+                            # at the end.
+                            snapshot = dict(cache)
+                            snapshot["meta"] = build_meta(len(cache), existing_meta)
+                            self._queue_for_flush(dir_path, snapshot)
+                            pbar.update(1)
+                    else:
+                        with ProcessPoolExecutor(max_workers=self.workers) as pool:""",
+            new="""\
+                if jobs and not self.dry_run:
+                    # Ollama is a single-instance server. Concurrent
+                    # vision requests cause HTTP 500 because the vision
+                    # encoder cache is not shareable. If any job carries
+                    # ai_desc work, serialise. Parallelism remains
+                    # available for bridge-only passes.
+                    needs_ollama = any("ai_desc" in job[3] for job in jobs)
+                    if needs_ollama and self.workers > 1:
+                        log.warning(
+                            "ai_desc work present; serialising despite "
+                            "workers=%d (Ollama is single-instance).",
+                            self.workers,
+                        )
+                    if self.workers <= 1 or needs_ollama:
+                        for job in jobs:
+                            path, entry = process_worker(job)
+                            cache[job_meta[path]["fname"]] = entry
+                            stats["files_updated"] += 1
+                            # Snapshot after each image so a long directory is
+                            # observable within the flush interval, not just
+                            # at the end.
+                            snapshot = dict(cache)
+                            snapshot["meta"] = build_meta(len(cache), existing_meta)
+                            self._queue_for_flush(dir_path, snapshot)
+                            pbar.update(1)
+                    else:
+                        with ProcessPoolExecutor(max_workers=self.workers) as pool:""",
+        ),
+    ]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Patch table — src/imgdesc/main.py
+# ══════════════════════════════════════════════════════════════════════
+
+def _p_main() -> List[Patch]:
+    return [
+        Patch(
+            "--workers help text reflects the real default",
+            old="""\
+    parser.add_argument("-w", "--workers", type=int, default=1,
+                        help="Worker processes (default: CPU count).")""",
+            new="""\
+    parser.add_argument("-w", "--workers", type=int, default=1,
+                        help="Worker processes. Default 1: Ollama is "
+                             "single-instance, and concurrent vision "
+                             "requests cause HTTP 500. Values >1 only "
+                             "help for bridge-only passes.")""",
+        ),
+        Patch(
+            "add --num-ctx option",
+            old="""\
+    parser.add_argument("--max-dim", type=int, default=None,
+                        help="Override the long edge of the image sent to the "
+                             "model, in pixels. Default: per --depth.")""",
+            new="""\
+    parser.add_argument("--max-dim", type=int, default=None,
+                        help="Override the long edge of the image sent to the "
+                             "model, in pixels. Default: per --depth.")
+    parser.add_argument("--num-ctx", type=int, default=None,
+                        help="Context window sent to Ollama, in tokens. "
+                             "Default: derived from --depth "
+                             "(brief=8192, standard=12288, deep=16384). "
+                             "Raise if Ollama returns HTTP 500 with an "
+                             "exceeds-context-size error.")""",
+        ),
+        Patch(
+            "pass num_ctx through to the builder",
+            old="""\
+    builder = ImageDescBuilder(
+        root_dir=str(root),
+        workers=args.workers,
+        force=args.force,
+        dry_run=args.dry_run,
+        timeout=args.timeout,
+        depth=args.depth,
+        positioning=not args.no_positioning,
+        max_dim=args.max_dim,
+        keep_raw=args.keep_raw,
+    )""",
+            new="""\
+    builder = ImageDescBuilder(
+        root_dir=str(root),
+        workers=args.workers,
+        force=args.force,
+        dry_run=args.dry_run,
+        timeout=args.timeout,
+        depth=args.depth,
+        positioning=not args.no_positioning,
+        max_dim=args.max_dim,
+        keep_raw=args.keep_raw,
+        num_ctx=args.num_ctx,
+    )""",
+        ),
+    ]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Patch table — src/imgdesc/cache_io.py
+# ══════════════════════════════════════════════════════════════════════
+
+def _p_cache_io() -> List[Patch]:
+    return [
+        Patch(
+            "fsync the directory after the atomic rename",
+            old="""\
+        os.replace(tmp_name, cache_path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise""",
+            new="""\
+        os.replace(tmp_name, cache_path)
+        # fsync the directory so the rename is durable. Not supported
+        # on every platform/filesystem; failure here is not fatal.
+        try:
+            dir_fd = os.open(str(dir_path), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise""",
+        ),
+    ]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Patch table — src/imgdesc/subject.py
+# ══════════════════════════════════════════════════════════════════════
+
+def _p_subject() -> List[Patch]:
+    return [
+        Patch(
+            "_face_region_stats: detect scale by value, not parameter",
+            old="""\
+    x0, y0, x1, y1 = (float(v) for v in box)
+    if coord_scale == "auto" or max(abs(x0), abs(x1)) <= 1.01:
+        x0, y0, x1, y1 = x0 * 100, y0 * 100, x1 * 100, y1 * 100""",
+            new="""\
+    x0, y0, x1, y1 = (float(v) for v in box)
+    # Detect the coordinate scale from the values, not from the
+    # parameter name. A normalised box (all values in [-1.01, 1.01])
+    # is scaled to [0, 100]. Otherwise the box is assumed to already be
+    # on the [0, 100] scale. The previous code scaled on every call,
+    # sending percentage boxes to [0, 10000] and returning no nodes
+    # inside for the face region.
+    if coord_scale == "0-1":
+        x0, y0, x1, y1 = x0 * 100, y0 * 100, x1 * 100, y1 * 100
+    elif coord_scale == "0-100":
+        pass
+    else:
+        if max(abs(x0), abs(y0), abs(x1), abs(y1)) <= 1.01:
+            x0, y0, x1, y1 = x0 * 100, y0 * 100, x1 * 100, y1 * 100""",
+        ),
+        Patch(
+            "add _desc_of helper and use it in synthesise",
+            old="""\
+def synthesise(records):
+    if not records:
+        return {"count": 0, "invariants": {}, "variations": {},
+                "source_ids": [], "coverage": {}}
+
+    parsed = []
+    for r in records:
+        raw = r.get("ai_desc")
+        if not raw:
+            continue
+        try:
+            d = _json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            continue
+        if isinstance(d, dict):
+            parsed.append(d)""",
+            new="""\
+def _desc_of(r):
+    \"\"\"Extract the ai_desc dict from a record, tolerating either shape.
+
+    Records arriving from the pykelet pipeline may be full cache
+    entries (with an "ai_desc" key), bare ai_desc dicts (with
+    "sections" or "categories" at top level), or the legacy string
+    form where ai_desc is a JSON string. Returns the ai_desc dict,
+    or None if nothing usable.
+    \"\"\"
+    if not isinstance(r, dict):
+        return None
+    raw = r.get("ai_desc")
+    if raw is None:
+        if any(k in r for k in ("sections", "categories", "description")):
+            return r
+        return None
+    if isinstance(raw, str):
+        try:
+            obj = _json.loads(raw)
+        except Exception:
+            return None
+        return obj if isinstance(obj, dict) else None
+    return raw if isinstance(raw, dict) else None
+
+
+def synthesise(records):
+    if not records:
+        return {"count": 0, "invariants": {}, "variations": {},
+                "source_ids": [], "coverage": {}}
+
+    parsed = []
+    for r in records:
+        d = _desc_of(r)
+        if d is not None:
+            parsed.append(d)""",
+        ),
+        Patch(
+            "synth_prompt: use _desc_of for shape tolerance",
+            old="""\
+    parsed = []
+    for r in records:
+        raw = r.get("ai_desc") if isinstance(r, dict) else None
+        if not raw:
+            continue
+        try:
+            d = _json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            continue
+        if isinstance(d, dict):
+            parsed.append(d)
+
+    n = len(parsed)""",
+            new="""\
+    parsed = []
+    for r in records:
+        d = _desc_of(r)
+        if d is not None:
+            parsed.append(d)
+
+    n = len(parsed)""",
+        ),
+    ]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Patch table — machines/subject_cluster.py
+# ══════════════════════════════════════════════════════════════════════
+
+def _p_subject_cluster() -> List[Patch]:
+    return [
+        Patch(
+            "normalise record shape before fingerprint",
+            old="""\
+    # Fingerprints need ai_desc and visual_sig. Records passed by the
+    # pipeline via collect_from are task results, which have ai_desc.
+    fps = []
+    for i, r in enumerate(records):
+        if not isinstance(r, dict):
+            continue
+        # The collect_from mechanism passes task results. The result of a
+        # describe task IS the ai_desc dict plus whatever the machine added,
+        # but not the visual_sig — that lives in the cache. So use the
+        # fingerprint the machine already computed in the cache if present.
+        fp = r.get("subject_fingerprint")
+        if fp is None:
+            fp = fingerprint({"ai_desc": json.dumps(r),
+                              "visual_sig": r.get("visual_sig")})
+        if fp is not None:
+            key = r.get("__rel_path") or r.get("image_path") or f"item_{i}"
+            fps.append((key, fp))""",
+            new="""\
+    # Records arrive in one of two shapes:
+    #   * full cache entries:    {"ai_desc": {...}, "visual_sig": [...]}
+    #   * bare ai_desc dicts:    {"sections": {...}, "categories": [...]}
+    # Normalise to what fingerprint() expects: a dict with an "ai_desc"
+    # key whose value is the description (dict or JSON string), plus an
+    # optional "visual_sig". The previous version wrapped the whole
+    # record with json.dumps, producing a top-level object with no
+    # "categories" and making fingerprint() return None for every
+    # record — silently collapsing every cluster to a singleton.
+    def _as_entry(r):
+        if not isinstance(r, dict):
+            return None
+        if "ai_desc" in r:
+            return r
+        if any(k in r for k in ("sections", "categories", "description")):
+            return {"ai_desc": r, "visual_sig": r.get("visual_sig")}
+        return None
+
+    fps = []
+    for i, r in enumerate(records):
+        entry = _as_entry(r)
+        if entry is None:
+            continue
+        fp = r.get("subject_fingerprint")
+        if fp is None:
+            fp = fingerprint(entry)
+        if fp is not None:
+            key = r.get("__rel_path") or r.get("image_path") or f"item_{i}"
+            fps.append((key, fp))""",
+        ),
+    ]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Patch table assembly
+# ══════════════════════════════════════════════════════════════════════
+
+def build_patch_table() -> List[Tuple[str, List[Patch]]]:
+    return [
+        ("src/imgdesc/desc_builder.py",    _p_desc_builder()),
+        ("src/imgdesc/main.py",            _p_main()),
+        ("src/imgdesc/cache_io.py",        _p_cache_io()),
+        ("src/imgdesc/subject.py",         _p_subject()),
+        ("machines/subject_cluster.py",    _p_subject_cluster()),
+    ]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Project-specific config and entry point
+# ══════════════════════════════════════════════════════════════════════
+
+ROOT_MARKER = "src/imgdesc/desc_builder.py"
+
+VERIFY = """\
+Verify the fixes are effective:
+
+  1. imgdesc-build --check
+     Expect: "declares vision capability", then either a passing probe
+     or a clear OOM warning with remediation steps. If the model has no
+     vision at all, expect an explicit "does not declare a vision
+     capability" message instead of a confusing 500 on image one.
+
+  2. imgdesc build /path/to/a/few/pictures -v --depth brief
+     Transient 500s should log "attempt N/M, retrying in Xs" with the
+     Ollama body. On success, stage_metrics.*.num_ctx is in the cache.
+
+  3. imgdesc report /path/to/pictures
+     prompt_hash histogram should be one (or few) hashes.
+
+  Undo everything with: python patch_imgdesc.py --restore
+"""
+
+
+if __name__ == "__main__":
+    sys.exit(run(
+        build_patch_table(),
+        root_marker=ROOT_MARKER,
+        verify_notes=VERIFY,
+        prog="patch_imgdesc",
+    ))

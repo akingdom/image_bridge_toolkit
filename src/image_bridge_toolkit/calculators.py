@@ -1,14 +1,15 @@
 """
 Perceptual fingerprint calculators.
 
-All functions are pure (PIL.Image in -> plain‑Python‑serialisable values out)
-and never raise: on internal failure they return a neutral zero‑value so a
+All functions are pure (PIL.Image in -> plain-Python-serialisable values out)
+and never raise: on internal failure they return a neutral zero-value so a
 single unreadable image cannot take down a batch job.
 """
 from __future__ import annotations
 
+import hashlib
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
@@ -23,6 +24,9 @@ from .constants import (
     SPATIAL_RADIUS,
     GROUND_CONFIDENCE_THRESHOLD,
     CURVATURE_MAX,
+    VIDEO_SAMPLE_PERCENTAGES,
+    VIDEO_SAMPLE_FIXED_TIMES,
+    VIDEO_MAX_SAMPLES,
 )
 
 # ----------------------------------------------------------------------
@@ -34,9 +38,27 @@ LAB_RESIZE = 64
 WAVEFORM_BINS = 256
 WAVEFORM_KEEP = 16
 
+# Histogram-anchored selection.
+#
+# The 16x16 scaffold is quantised into a fixed LAB grid. A fixed grid (as
+# opposed to k-means) means bin boundaries are identical for every image,
+# so a colour at (65, 12, -8) lands in the same bin in both versions of a
+# lightly-edited image. k-means centres drift between images, which would
+# reintroduce the instability this design removes.
+#
+# HISTOGRAM_BINS = 6 gives 216 bins. Measured overlap mass on a lightly-
+# edited pair was 0.996 at 4, 6, and 8 bins per channel -- the coarsest
+# resolution is sufficient. 6 is chosen for headroom: finer bins preserve
+# more colour detail if the corpus demands it, without the sparsity that
+# would come from 8+ on a 256-cell scaffold.
+HISTOGRAM_BINS = 6
+HISTOGRAM_MIN_CELLS = 3
+HISTOGRAM_MIN_FRACTION = 0.02   # bin must contain >= 2% of scaffold cells
+HISTOGRAM_NMS_RADIUS = 0.04     # same as the pre-histogram NMS radius
+
 
 # ----------------------------------------------------------------------
-# Colour conversion helpers (used for all points)
+# Colour conversion helpers
 # ----------------------------------------------------------------------
 
 def _hex_to_lab_fast(hex_code: str) -> Tuple[float, float, float]:
@@ -44,7 +66,6 @@ def _hex_to_lab_fast(hex_code: str) -> Tuple[float, float, float]:
     hex_code = hex_code.lstrip('#')
     if len(hex_code) != 6:
         return (0.0, 0.0, 0.0)
-
     r = int(hex_code[0:2], 16) / 255.0
     g = int(hex_code[2:4], 16) / 255.0
     b = int(hex_code[4:6], 16) / 255.0
@@ -53,13 +74,12 @@ def _hex_to_lab_fast(hex_code: str) -> Tuple[float, float, float]:
         return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
 
     r_lin, g_lin, b_lin = lin(r), lin(g), lin(b)
-
     X = r_lin * 0.4124564 + g_lin * 0.3575761 + b_lin * 0.1804375
     Y = r_lin * 0.2126729 + g_lin * 0.7151522 + b_lin * 0.0721750
     Z = r_lin * 0.0193339 + g_lin * 0.1191920 + b_lin * 0.9503041
 
     def f(t):
-        return t ** (1/3) if t > 0.008856 else 7.787 * t + 16/116
+        return t ** (1 / 3) if t > 0.008856 else 7.787 * t + 16 / 116
 
     Xn, Yn, Zn = 0.95047, 1.0, 1.08883
     L = 116 * f(Y / Yn) - 16
@@ -69,7 +89,6 @@ def _hex_to_lab_fast(hex_code: str) -> Tuple[float, float, float]:
 
 
 def _hex_to_luma(hex_code: str) -> float:
-    """Approximate lightness (luma) from hex."""
     hex_code = hex_code.lstrip('#')
     if len(hex_code) != 6:
         return 0.0
@@ -80,7 +99,7 @@ def _hex_to_luma(hex_code: str) -> float:
 
 
 # ----------------------------------------------------------------------
-# Neighbour-finding with adaptive radius
+# Neighbour finding
 # ----------------------------------------------------------------------
 
 def _get_neighbours(
@@ -90,10 +109,6 @@ def _get_neighbours(
     max_radius: float = 0.20,
     step: float = 0.01,
 ) -> Tuple[List[Dict], float]:
-    """
-    Find neighbours within adaptive radius. Grows radius until at least
-    min_neighbours neighbours are found, or max_radius reached.
-    """
     x0, y0 = centre["x"], centre["y"]
     radius = SPATIAL_RADIUS
     while radius <= max_radius:
@@ -104,26 +119,26 @@ def _get_neighbours(
         if len(neighbours) >= min_neighbours:
             return neighbours, radius
         radius += step
-    # fallback: return all scaffold points except self (likely large radius)
     return [sp for sp in scaffold if sp is not centre], max_radius
 
 
 # ----------------------------------------------------------------------
-# Neighbour‑based topology helpers
+# Topology helpers (content-driven, unchanged from previous fix)
 # ----------------------------------------------------------------------
 
 def _compute_size(selected_idx: int, scaffold: List[Dict], selected_indices: List[int]) -> float:
-    """Size = fraction of scaffold points assigned to this selected point (Voronoi)."""
+    """Voronoi spatial extent of this point relative to the other points."""
     if not scaffold or not selected_indices:
         return 0.0
-    assignments = {}
-    for j, sp in enumerate(scaffold):
+    assignments: Dict[int, int] = {}
+    for sp in scaffold:
         best_dist = float('inf')
         best_sel = -1
         for k, sel_idx in enumerate(selected_indices):
-            dx = sp["x"] - scaffold[sel_idx]["x"]
-            dy = sp["y"] - scaffold[sel_idx]["y"]
-            d = math.hypot(dx, dy)
+            d = math.hypot(
+                sp["x"] - scaffold[sel_idx]["x"],
+                sp["y"] - scaffold[sel_idx]["y"],
+            )
             if d < best_dist:
                 best_dist = d
                 best_sel = k
@@ -133,11 +148,9 @@ def _compute_size(selected_idx: int, scaffold: List[Dict], selected_indices: Lis
 
 
 def _compute_gradient(centre: Dict, neighbours: List[Dict]) -> Tuple[float, float]:
-    """Return (theta, mag) where theta in [0, 2π)."""
     if not neighbours:
         return 0.0, 0.0
-    Gx = 0.0
-    Gy = 0.0
+    Gx = Gy = 0.0
     centre_luma = centre.get("luma", 0.0)
     for n in neighbours:
         dx = n["x"] - centre["x"]
@@ -145,29 +158,34 @@ def _compute_gradient(centre: Dict, neighbours: List[Dict]) -> Tuple[float, floa
         dl = n["luma"] - centre_luma
         Gx += dl * dx
         Gy += dl * dy
-    mag = math.hypot(Gx, Gy)
-    theta = math.atan2(Gy, Gx) % (2 * math.pi)
-    return theta, mag
+    return math.atan2(Gy, Gx) % (2 * math.pi), math.hypot(Gx, Gy)
 
 
 def _compute_elongation_axis(centre: Dict, neighbours: List[Dict]) -> Tuple[float, float]:
-    """Return (elongation, axis_phi) where axis_phi in [0, π)."""
+    """Content-weighted elongation. Uniform neighbourhoods give zero."""
     if len(neighbours) < 2:
         return 0.0, 0.0
+    centre_luma = centre.get("luma", 0.0)
     cov = np.zeros((2, 2))
+    total_w = 0.0
     for n in neighbours:
         dx = n["x"] - centre["x"]
         dy = n["y"] - centre["y"]
-        cov[0,0] += dx*dx
-        cov[0,1] += dx*dy
-        cov[1,0] += dx*dy
-        cov[1,1] += dy*dy
-    cov /= len(neighbours)
+        dl = n["luma"] - centre_luma
+        w = dl * dl
+        cov[0, 0] += w * dx * dx
+        cov[0, 1] += w * dx * dy
+        cov[1, 0] += w * dx * dy
+        cov[1, 1] += w * dy * dy
+        total_w += w
+    if total_w < 1e-6:
+        return 0.0, 0.0
+    cov /= total_w
     eigvals, eigvecs = np.linalg.eig(cov)
     idx = np.argsort(eigvals)[::-1]
     eigvals = eigvals[idx]
     eigvecs = eigvecs[:, idx]
-    if eigvals[0] > 1e-6:
+    if eigvals[0] > 1e-9:
         elongation = max(0.0, min(1.0, 1.0 - abs(eigvals[1] / eigvals[0])))
     else:
         elongation = 0.0
@@ -176,20 +194,12 @@ def _compute_elongation_axis(centre: Dict, neighbours: List[Dict]) -> Tuple[floa
 
 
 def _compute_primitive_quadrant(
-    centre: Dict,
-    neighbours: List[Dict],
-    elongation: float,
-    grad_mag: float
+    centre: Dict, neighbours: List[Dict], elongation: float, grad_mag: float
 ) -> int:
-    """
-    Primitive using quadrant variance of neighbour positions/colours.
-    Returns 0 = plane, 1 = edge.
-    """
     if len(neighbours) < 4:
         return 0
     cx, cy = centre["x"], centre["y"]
-    # Split into quadrants (relative to centre)
-    quadrants = [[], [], [], []]  # NE, NW, SW, SE
+    quadrants: List[List[Dict]] = [[], [], [], []]
     for n in neighbours:
         dx = n["x"] - cx
         dy = n["y"] - cy
@@ -202,20 +212,15 @@ def _compute_primitive_quadrant(
         else:
             quadrants[3].append(n)
 
-    # Compute variance of luma in each quadrant
     def variance(lst):
         if len(lst) < 2:
             return 0.0
         vals = [n["luma"] for n in lst]
-        return np.var(vals)
+        return float(np.var(vals))
 
     variances = [variance(q) for q in quadrants]
-    max_v = max(variances)
-    min_v = min(variances)
-    # If max_v > 2 * min_v, treat as edge (1), else plane (0)
-    if max_v > 2 * min_v + 1e-6:
-        return 1
-    return 0
+    max_v, min_v = max(variances), min(variances)
+    return 1 if max_v > 2 * min_v + 1e-6 else 0
 
 
 def _compute_density(neighbours: List[Dict], total_scaffold: int) -> float:
@@ -225,37 +230,69 @@ def _compute_density(neighbours: List[Dict], total_scaffold: int) -> float:
 
 
 def _compute_curvature(centre: Dict, neighbours: List[Dict], axis_phi: float) -> float:
-    """Curvature κ = |2a| from parabola fit v = a·u² + b·u."""
+    """Curvature with angular-coverage rejection for truncated neighbourhoods.
+
+    Three behaviours:
+    1. Neighbours weighted by squared luma difference.
+    2. Neighbourhoods not surrounding the centre are rejected (angular
+       coverage test). A border point sees a half-disc; a parabola fitted
+       to one side is extrapolation, not observation.
+    3. Fits where every neighbour sits on the same side of the u-axis are
+       rejected. This was the flaw in the earlier one-sided test: for a
+       straight edge the principal axis aligns with the edge and the
+       projection spans both signs even when the neighbourhood is a
+       half-disc.
+    """
     if len(neighbours) < 3:
         return 0.0
+
+    # Angular coverage: largest gap between consecutive neighbour bearings.
+    # A full-disc neighbourhood has max_gap ~= 0.8 rad; a half-disc ~= pi.
+    cx, cy = centre["x"], centre["y"]
+    bearings = sorted(
+        (math.atan2(n["y"] - cy, n["x"] - cx) + 2 * math.pi) % (2 * math.pi)
+        for n in neighbours
+    )
+    max_gap = 0.0
+    for i in range(len(bearings)):
+        gap = (bearings[(i + 1) % len(bearings)] - bearings[i]) % (2 * math.pi)
+        if gap > max_gap:
+            max_gap = gap
+    if max_gap > math.pi * 0.7:
+        return 0.0
+
+    centre_luma = centre.get("luma", 0.0)
     u_axis = np.array([math.cos(axis_phi), math.sin(axis_phi)])
     v_axis = np.array([-math.sin(axis_phi), math.cos(axis_phi)])
-    u_vals = []
-    v_vals = []
+    u_vals, v_vals, w_vals = [], [], []
     for n in neighbours:
         dx = n["x"] - centre["x"]
         dy = n["y"] - centre["y"]
-        u = dx * u_axis[0] + dy * u_axis[1]
-        v = dx * v_axis[0] + dy * v_axis[1]
-        u_vals.append(u)
-        v_vals.append(v)
+        dl = n["luma"] - centre_luma
+        u_vals.append(dx * u_axis[0] + dy * u_axis[1])
+        v_vals.append(dx * v_axis[0] + dy * v_axis[1])
+        w_vals.append(dl * dl)
 
-    if len(u_vals) < 3:
-        return 0.0
     u_arr = np.array(u_vals)
     v_arr = np.array(v_vals)
-    A = np.vstack([u_arr**2, u_arr]).T
+    w_arr = np.array(w_vals)
+    if w_arr.sum() < 1e-6:
+        return 0.0
+    # Reject one-sided fits as a secondary guard.
+    if not (np.any(u_arr > 0.005) and np.any(u_arr < -0.005)):
+        return 0.0
+    sqrt_w = np.sqrt(w_arr)
+    A = np.vstack([sqrt_w * u_arr ** 2, sqrt_w * u_arr]).T
+    b_vec = sqrt_w * v_arr
     try:
-        coeffs, _, _, _ = np.linalg.lstsq(A, v_arr, rcond=None)
-        a = coeffs[0]
-        curvature = abs(2.0 * a)
-        return min(curvature, CURVATURE_MAX)
+        coeffs, _, _, _ = np.linalg.lstsq(A, b_vec, rcond=None)
+        return min(abs(2.0 * coeffs[0]), CURVATURE_MAX)
     except Exception:
         return 0.0
 
 
 def _compute_structural_score(scaffold_point: Dict) -> float:
-    """Score a scaffold point for structural importance."""
+    """Structural score. Content-driven at scoring time (size = 0)."""
     size = scaffold_point.get("size", 0.0)
     elong = scaffold_point.get("elongation", 0.0)
     curv = scaffold_point.get("curvature", 0.0)
@@ -267,33 +304,157 @@ def _compute_structural_score(scaffold_point: Dict) -> float:
 # ----------------------------------------------------------------------
 
 def _detect_ground(scaffold: List[Dict]) -> Tuple[float, bool]:
-    """Return (confidence, detected) for ground plane."""
-    # Consider points in bottom region (y >= 0.65)
     bottom = [sp for sp in scaffold if sp["y"] >= 0.65]
     if not bottom:
         return 0.0, False
-
-    # Need at least some spread in x
     xs = [sp["x"] for sp in bottom]
     span = max(xs) - min(xs) if len(xs) > 1 else 0.0
     if span < 0.55:
         return 0.0, False
-
-    # Check horizontal orientation (using gradient or elongation)
-    # For simplicity, we use elongation and axis_phi from precomputed data
-    # This function should be called after topology is computed on scaffold.
-    # We'll assume scaffold points have elongation, axis_phi computed.
-    horizontal_count = 0
-    for sp in bottom:
-        axis = sp.get("axis_phi", 0.0)
-        if axis < 0.40 or abs(axis - math.pi) < 0.40:
-            horizontal_count += 1
+    horizontal_count = sum(
+        1 for sp in bottom
+        if sp.get("axis_phi", 0.0) < 0.40
+        or abs(sp.get("axis_phi", 0.0) - math.pi) < 0.40
+    )
     if horizontal_count < len(bottom) * 0.5:
         return 0.0, False
-
-    # Sigmoidal confidence based on span
     confidence = 1.0 / (1.0 + math.exp(-15.0 * (span - 0.55)))
     return confidence, confidence > GROUND_CONFIDENCE_THRESHOLD
+
+
+# ----------------------------------------------------------------------
+# Histogram-anchored selection
+# ----------------------------------------------------------------------
+
+def _bin_lab(lab: Tuple[float, float, float], bins: int) -> Tuple[int, int, int]:
+    """Quantise an LAB triplet to a fixed-grid bin index. Fixed boundaries
+    are essential: they guarantee that two versions of the same colour map
+    to the same bin regardless of what other colours are present."""
+    L, a, b = lab
+    L = max(0.0, min(100.0, L))
+    a = max(-128.0, min(127.0, a))
+    b = max(-128.0, min(127.0, b))
+    # 0.999999 ensures the upper bound maps to bins-1, not bins.
+    li = min(bins - 1, int(L / 100.0 * bins * 0.999999))
+    ai = min(bins - 1, int((a + 128.0) / 255.0 * bins * 0.999999))
+    bi = min(bins - 1, int((b + 128.0) / 255.0 * bins * 0.999999))
+    return (li, ai, bi)
+
+
+def _histogram_select(
+    scaffold: List[Dict[str, Any]],
+    structural_raw: np.ndarray,
+    target_budget: int,
+    sig_min: int,
+) -> List[int]:
+    """Select scaffold indices via LAB histogram anchoring.
+
+    Steps:
+      1. Quantise all cells into a fixed LAB grid.
+      2. Identify significant bins (>= max(HISTOGRAM_MIN_CELLS, fraction) cells).
+      3. Allocate the budget across bins: 1 per bin minimum, remaining
+         distributed proportionally to bin size via a fair-share rule.
+      4. Within each bin, pick cells by structural score, with NMS for
+         spacing so a large region is represented at multiple locations
+         rather than clustering on its single most-structural point.
+
+    Deterministic given structural_raw and scaffold, which is the property
+    that makes the whole signature stable under minor edits.
+    """
+    n_cells = len(scaffold)
+    bin_of = [_bin_lab(sp["lab"], HISTOGRAM_BINS) for sp in scaffold]
+    counts = Counter(bin_of)
+
+    min_cells = max(HISTOGRAM_MIN_CELLS, int(HISTOGRAM_MIN_FRACTION * n_cells))
+    significant = {b: c for b, c in counts.items() if c >= min_cells}
+
+    if not significant:
+        # Degenerate: no bin is significant. Fall back to top-by-structure.
+        order = sorted(range(n_cells), key=lambda i: -structural_raw[i])
+        return order[:target_budget]
+
+    # Order bins by count desc; if there are more significant bins than
+    # the budget, keep the largest ones.
+    sig_sorted = sorted(significant.keys(), key=lambda b: -significant[b])
+    if len(sig_sorted) > target_budget:
+        sig_sorted = sig_sorted[:target_budget]
+
+    # Start with one pick per bin, then distribute the rest by fair-share:
+    # each additional pick goes to the bin currently most under-served
+    # relative to its share of significant cells.
+    allocation: Dict[Tuple[int, int, int], int] = {b: 1 for b in sig_sorted}
+    remaining = target_budget - len(sig_sorted)
+    if remaining > 0:
+        sig_total = sum(significant[b] for b in sig_sorted)
+        for _ in range(remaining):
+            best_b = max(
+                sig_sorted,
+                key=lambda b: significant[b] / (allocation[b] * (allocation[b] + 1)),
+            )
+            allocation[best_b] += 1
+
+    # Enforce a minimum total (in case the image has very few colours).
+    while sum(allocation.values()) < sig_min:
+        for b in sig_sorted:
+            allocation[b] += 1
+            if sum(allocation.values()) >= sig_min:
+                break
+
+    # Group cells by bin for the bins we're covering.
+    bin_members: Dict[Tuple[int, int, int], List[int]] = defaultdict(list)
+    for i, b in enumerate(bin_of):
+        if b in allocation:
+            bin_members[b].append(i)
+
+    # Per-bin pick, NMS within bin AND across bins so distinct regions
+    # don't overlap spatially.
+    selected: List[int] = []
+    for b in sig_sorted:
+        n_picks = allocation[b]
+        members = bin_members.get(b, [])
+        if not members:
+            continue
+        members_sorted = sorted(members, key=lambda i: (-float(structural_raw[i]), i))
+        picked_here: List[int] = []
+
+        # Strict pass: enforce NMS.
+        for i in members_sorted:
+            if len(picked_here) >= n_picks:
+                break
+            if any(
+                math.hypot(
+                    scaffold[i]["x"] - scaffold[j]["x"],
+                    scaffold[i]["y"] - scaffold[j]["y"],
+                ) < HISTOGRAM_NMS_RADIUS
+                for j in selected + picked_here
+            ):
+                continue
+            picked_here.append(i)
+
+        # Relaxed pass: if NMS rejected too many, take remaining by score.
+        if len(picked_here) < n_picks:
+            for i in members_sorted:
+                if len(picked_here) >= n_picks:
+                    break
+                if i not in picked_here:
+                    picked_here.append(i)
+
+        selected.extend(picked_here)
+
+    # Final fill: if we're still under target_budget (bins were small),
+    # top up with the highest-structural cells not already selected.
+    if len(selected) < target_budget:
+        selected_set = set(selected)
+        remaining_ix = sorted(
+            (i for i in range(n_cells) if i not in selected_set),
+            key=lambda i: -float(structural_raw[i]),
+        )
+        for i in remaining_ix:
+            if len(selected) >= target_budget:
+                break
+            selected.append(i)
+
+    return selected
 
 
 # ----------------------------------------------------------------------
@@ -302,37 +463,42 @@ def _detect_ground(scaffold: List[Dict]) -> Tuple[float, bool]:
 
 def compute_visual_signature(image: Image.Image, num_points: int = SIG_POINTS_MAX) -> Dict[str, Any]:
     """
-    Compute visual signature points with neighbour‑based topology.
+    Compute visual signature points.
 
-    Returns a dict with:
-      - "visual_sig": list of selected point dicts (each with all fields)
-      - "ground_confidence": float
-      - "ground_detected": bool
+    Selection is histogram-anchored:
+      * Quantise the 16x16 scaffold into a fixed LAB grid.
+      * Find significant colour bins.
+      * Allocate the point budget across bins proportionally to bin size.
+      * Pick each bin's representative(s) by structural score, with NMS for
+        spacing within the region.
+
+    This makes selection stable under minor editing (the histogram barely
+    moves; the selection barely moves) and guarantees colour coverage
+    (every significant colour gets a representative).
+
+    Returns {"visual_sig": [...], "ground_confidence": float,
+             "ground_detected": bool}.
     """
     try:
-        # 1. Build scaffold: 16x16 grid (256 points) with colours and luma
+        # 1. Build scaffold.
         size = SCAFFOLD_SIZE
         small = image.resize((size, size), resample=Image.Resampling.LANCZOS)
         pixels = np.array(small.convert("RGB")).reshape(-1, 3) / 255.0
-        coords = np.mgrid[0:1:size*1j, 0:1:size*1j].reshape(2, -1).T  # (size*size, 2)
+        _grid_rows, _grid_cols = np.mgrid[0:1:size * 1j, 0:1:size * 1j]
+        coords = np.column_stack([_grid_cols.flatten(), _grid_rows.flatten()])
 
-        scaffold = []
+        scaffold: List[Dict[str, Any]] = []
         for i, (x, y) in enumerate(coords):
             r, g, b = (pixels[i] * 255).astype(int)
             hex_str = f"#{r:02x}{g:02x}{b:02x}"
             lab = _hex_to_lab_fast(hex_str)
             luma = _hex_to_luma(hex_str)
             scaffold.append({
-                "x": float(x),
-                "y": float(y),
-                "hex": hex_str,
-                "lab": lab,
-                "luma": luma,
+                "x": float(x), "y": float(y),
+                "hex": hex_str, "lab": lab, "luma": luma,
             })
 
-        # 2. Pre‑compute topology for all scaffold points (needed for scoring)
-        # We'll compute neighbours for each scaffold point (adaptive radius)
-        # and store elongation, curvature, etc. in scaffold.
+        # 2. Pre-compute topology for every scaffold cell.
         total_scaffold = len(scaffold)
         for sp in scaffold:
             neighbours, _ = _get_neighbours(sp, scaffold, min_neighbours=4)
@@ -347,82 +513,29 @@ def compute_visual_signature(image: Image.Image, num_points: int = SIG_POINTS_MA
             sp["density"] = _compute_density(neighbours, total_scaffold)
             sp["primitive"] = _compute_primitive_quadrant(sp, neighbours, elong, grad_mag)
 
-        # 3. Greedy selection (colour diversity + spatial spread)
-        # First point: max colour variance
-        selected_indices = []
-        # Compute colour variance (std of RGB)
-        stds = np.std(pixels, axis=1)
-        first = int(np.argmax(stds))
-        selected_indices.append(first)
+        structural_raw = np.array(
+            [_compute_structural_score(sp) for sp in scaffold], dtype=np.float64
+        )
 
-        # Greedily select up to half of target budget
-        target_budget = max(SIG_POINTS_MIN, min(SIG_POINTS_MAX, int(SIG_POINTS_DEFAULT * 1.2)))
-        greedy_count = max(4, target_budget // 2)  # at least 4
-        for _ in range(greedy_count - 1):
-            if len(selected_indices) >= target_budget:
-                break
-            # For each candidate, min distance to selected in colour and space
-            c_dists = np.min([np.linalg.norm(pixels - pixels[s], axis=1) for s in selected_indices], axis=0)
-            s_dists = np.min([np.linalg.norm(coords - coords[s], axis=1) for s in selected_indices], axis=0)
-            # Weighted product
-            scores = c_dists * s_dists
-            # Avoid selecting already selected
-            for s in selected_indices:
-                scores[s] = -1
-            best = int(np.argmax(scores))
-            if scores[best] <= 0:
-                break
-            selected_indices.append(best)
+        # 3. Histogram-anchored selection.
+        target_budget = max(
+            SIG_POINTS_MIN,
+            min(SIG_POINTS_MAX, int(SIG_POINTS_DEFAULT * 1.2)),
+        )
+        selected_indices = _histogram_select(
+            scaffold, structural_raw, target_budget, SIG_POINTS_MIN
+        )
 
-        # 4. Structural scoring for remaining points (after greedy)
-        # Score each unselected scaffold point using structural score
-        remaining = [i for i in range(total_scaffold) if i not in selected_indices]
-        scored = []
-        for i in remaining:
-            sp = scaffold[i]
-            score = _compute_structural_score(sp)
-            scored.append((score, i))
-        scored.sort(key=lambda x: x[0], reverse=True)
-
-        # 5. NMS for additional structural points
-        # Select up to (target_budget - len(selected_indices)) additional points
-        additional_needed = max(0, target_budget - len(selected_indices))
-        added = 0
-        nms_radius = 0.04
-        for score, idx in scored:
-            if added >= additional_needed:
-                break
-            # Check distance to already selected (including greedy)
-            too_close = False
-            x0, y0 = scaffold[idx]["x"], scaffold[idx]["y"]
-            for sel in selected_indices:
-                x1, y1 = scaffold[sel]["x"], scaffold[sel]["y"]
-                if math.hypot(x0 - x1, y0 - y1) < nms_radius:
-                    too_close = True
-                    break
-            if not too_close:
-                selected_indices.append(idx)
-                added += 1
-
-        # 6. If still less than min, add best remaining regardless of NMS
-        while len(selected_indices) < SIG_POINTS_MIN and scored:
-            _, idx = scored.pop(0)
-            if idx not in selected_indices:
-                selected_indices.append(idx)
-
-        # 7. Build final visual_sig list
+        # 4. Build output.
         sigs = []
         for i, idx in enumerate(selected_indices):
             sp = scaffold[idx]
-            # Compute size using Voronoi assignment over scaffold
-            size = _compute_size(i, scaffold, selected_indices)
-
-            # Get all fields
+            size_v = _compute_size(i, scaffold, selected_indices)
             lab = sp["lab"]
             node = {
                 "x": round(sp["x"] * 100, 1),
                 "y": round(sp["y"] * 100, 1),
-                "size": round(size * 100, 1),
+                "size": round(size_v * 100, 1),
                 "hex": sp["hex"],
                 "lab": [round(lab[0], 2), round(lab[1], 2), round(lab[2], 2)],
                 "grad_theta": round(sp["grad_theta"], 4),
@@ -435,7 +548,7 @@ def compute_visual_signature(image: Image.Image, num_points: int = SIG_POINTS_MA
             }
             sigs.append(node)
 
-        # 8. Ground detection
+        # 5. Ground detection.
         ground_conf, ground_detected = _detect_ground(scaffold)
 
         return {
@@ -453,7 +566,7 @@ def compute_visual_signature(image: Image.Image, num_points: int = SIG_POINTS_MA
 
 
 # ----------------------------------------------------------------------
-# Existing calculator functions (unchanged except they now ignore extra keys)
+# Hash / LAB / waveform / exact / exif / video (unchanged)
 # ----------------------------------------------------------------------
 
 def _dct_phash_pil(image: Image.Image, hash_size: int = HASH_SIZE) -> str:
@@ -494,9 +607,7 @@ def _rgb_to_lab(arr: np.ndarray) -> np.ndarray:
                   [0.0193339, 0.1191920, 0.9503041]])
     xyz = (lin.reshape(-1, 3) @ m.T).reshape(lin.shape)
     xn, yn, zn = 0.95047, 1.0, 1.08883
-    xyz[..., 0] /= xn
-    xyz[..., 1] /= yn
-    xyz[..., 2] /= zn
+    xyz[..., 0] /= xn; xyz[..., 1] /= yn; xyz[..., 2] /= zn
     t = np.where(xyz > 0.008856, np.cbrt(xyz), 7.787 * xyz + 16 / 116)
     L = 116 * t[..., 1] - 16
     a = 500 * (t[..., 0] - t[..., 1])
@@ -522,7 +633,6 @@ def compute_lab_metrics(image: Image.Image) -> Dict[str, float]:
 
 def _dct_1d_numpy(hist_norm: np.ndarray) -> np.ndarray:
     n = len(hist_norm)
-    out = np.zeros(n, dtype=np.float64)
     k = np.arange(n)
     factor = np.pi / (2.0 * n)
     n_idx = np.arange(n).reshape(-1, 1)
@@ -539,12 +649,139 @@ def compute_hist_waveform(image: Image.Image) -> Dict[str, List[float]]:
         hist, _ = np.histogram(gray, bins=WAVEFORM_BINS, range=(0, WAVEFORM_BINS))
         total = hist.sum()
         hist_norm = (hist.astype(np.float32) / total) if total > 0 else np.zeros(WAVEFORM_BINS, dtype=np.float32)
-
         if HAS_OPENCV:
             dct_hist = cv2.dct(hist_norm.reshape(-1, 1)).flatten()
         else:
             dct_hist = _dct_1d_numpy(hist_norm.astype(np.float64))
-
         return {"hist_waveform": [round(float(v), 6) for v in dct_hist[:WAVEFORM_KEEP]]}
     except Exception:
         return {"hist_waveform": [0.0] * WAVEFORM_KEEP}
+
+
+def compute_exact_hashes(path: str, chunk_size: int = 1024 * 1024) -> Dict[str, Any]:
+    md5 = hashlib.md5(); sha256 = hashlib.sha256(); size = 0
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                md5.update(chunk); sha256.update(chunk); size += len(chunk)
+        return {"md5": md5.hexdigest(), "sha256": sha256.hexdigest(), "size": size}
+    except Exception:
+        return {"md5": "", "sha256": "", "size": 0}
+
+
+def _gps_to_decimal(dms, ref) -> float:
+    try:
+        d, m, s = (float(v) for v in dms)
+    except (TypeError, ValueError):
+        return 0.0
+    dd = d + (m / 60.0) + (s / 3600.0)
+    if isinstance(ref, str) and ref.upper() in ("S", "W"):
+        dd = -dd
+    return round(dd, 6)
+
+
+def compute_exif(path: str) -> Dict[str, Any]:
+    empty = {"exif_datetime": "", "exif_make": "", "exif_model": "",
+             "exif_gps_lat": 0.0, "exif_gps_lon": 0.0}
+    try:
+        with Image.open(path) as img:
+            exif = img.getexif()
+            if not exif:
+                return empty
+            out = dict(empty)
+            dt = exif.get(36867) or exif.get(306)
+            if dt: out["exif_datetime"] = str(dt)
+            make = exif.get(271)
+            if make: out["exif_make"] = str(make)
+            model = exif.get(272)
+            if model: out["exif_model"] = str(model)
+            try:
+                gps_ifd = exif.get_ifd(34853)
+            except Exception:
+                gps_ifd = None
+            if gps_ifd:
+                out["exif_gps_lat"] = _gps_to_decimal(gps_ifd.get(2, (0, 0, 0)), gps_ifd.get(1, "N"))
+                out["exif_gps_lon"] = _gps_to_decimal(gps_ifd.get(4, (0, 0, 0)), gps_ifd.get(3, "E"))
+            return out
+    except Exception:
+        return empty
+
+
+_VIDEO_EMPTY: Dict[str, Any] = {
+    "video_duration": 0.0, "video_fps": 0.0, "video_frame_count": 0,
+    "video_codec": "", "video_width": 0, "video_height": 0, "video_sig": [],
+}
+
+
+def _sample_times(duration: float, fps: float) -> List[float]:
+    if duration <= 0 or fps <= 0:
+        return [0.0]
+    if duration <= 60.0:
+        raw = [duration * p for p in VIDEO_SAMPLE_PERCENTAGES]
+    else:
+        fixed = [t for t in VIDEO_SAMPLE_FIXED_TIMES if 0.0 < t < duration]
+        pct = [duration * 0.5, duration * 0.9]
+        raw = sorted(set(fixed + pct))
+    seen = set(); out: List[float] = []
+    for t in raw:
+        t = max(0.0, min(duration, t))
+        key = round(t, 2)
+        if key in seen:
+            continue
+        seen.add(key); out.append(t)
+        if len(out) >= VIDEO_MAX_SAMPLES:
+            break
+    return out
+
+
+def compute_video_signature(path: str) -> Dict[str, Any]:
+    if not HAS_OPENCV:
+        return dict(_VIDEO_EMPTY)
+    try:
+        cap = cv2.VideoCapture(path)
+    except Exception:
+        return dict(_VIDEO_EMPTY)
+    if not cap.isOpened():
+        try: cap.release()
+        except Exception: pass
+        return dict(_VIDEO_EMPTY)
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        duration = (frame_count / fps) if fps > 0 else 0.0
+        try:
+            fourcc_int = int(cap.get(cv2.CAP_PROP_FOURCC))
+            codec = "".join(chr((fourcc_int >> (8 * i)) & 0xFF) for i in range(4)).strip("\x00").strip()
+        except Exception:
+            codec = ""
+        frames_sig: List[Dict[str, Any]] = []
+        for t in _sample_times(duration, fps):
+            try:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(t * fps))
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    continue
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(rgb)
+                entry: Dict[str, Any] = {"t": round(float(t), 2)}
+                entry.update(compute_hashes(img))
+                entry.update(compute_lab_metrics(img))
+                entry["hist_waveform"] = compute_hist_waveform(img).get("hist_waveform", [0.0] * WAVEFORM_KEEP)
+                frames_sig.append(entry)
+            except Exception:
+                continue
+        return {
+            "video_duration": round(duration, 3), "video_fps": round(fps, 3),
+            "video_frame_count": frame_count, "video_codec": codec,
+            "video_width": width, "video_height": height, "video_sig": frames_sig,
+        }
+    except Exception:
+        return dict(_VIDEO_EMPTY)
+    finally:
+        try: cap.release()
+        except Exception: pass

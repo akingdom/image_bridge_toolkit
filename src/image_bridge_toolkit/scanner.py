@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 from typing import Iterator, List, Tuple
 
-from .constants import IGNORE_MARKER, VALID_EXTENSIONS
+from .constants import IGNORE_MARKER, VALID_EXTENSIONS, VIDEO_EXTENSIONS
 from .logging_utils import get_logger
 
 log = get_logger(__name__)
@@ -48,7 +48,7 @@ def scan_tree(root_dir: Path) -> Iterator[Tuple[Path, List[ImageEntry]]]:
                     stack.append(Path(entry.path))
                     continue
                 suffix = os.path.splitext(entry.name)[1].lower()
-                if suffix in VALID_EXTENSIONS:
+                if suffix in VALID_EXTENSIONS or suffix in VIDEO_EXTENSIONS:
                     mtime = int(entry.stat(follow_symlinks=False).st_mtime)
                     images.append((Path(entry.path), mtime))
             except OSError as exc:
